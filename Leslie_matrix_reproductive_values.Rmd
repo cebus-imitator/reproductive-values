@@ -1,0 +1,200 @@
+---
+title: "Code for generating reproductive values"
+output:
+  html_notebook: default
+  pdf_document: default
+---
+
+## Data source
+
+We use life table data from Hernández-Pacheco et al (2013) (Table A1) to re-create reproductive values for rhesus macaques shown in Hasegawa & Kutsukake (2019) (Figure 1).
+
+```{r}
+library(tidyverse)
+
+p <- readxl::read_excel("Hernández-Pacheco_et_al_2013_A1.xlsx")
+
+p$age <- p$`χ age`
+p$mx <- p$Fx   #age-specific fertility
+p$lx <- p$lχ   #probability of surviving from birth to age x
+p$px <- p$`Pχ` #age-specific survival rate
+
+p <- p |> select(age, mx, lx, px, Nχ) |> filter(is.na(age)==F)
+p <- as.data.frame(p)
+
+head(p)
+```
+
+## Create Leslie matrix
+
+This is based on code provided by: 
+https://shinyibv02.uio.no/content/0b6ba04a-44a1-4a99-baaf-9a1caff48698/s03-MatrixModels.html
+
+```{r}
+Create.Amat <- function(Svec, Fvec) {
+	k <- length(Svec)
+	MatA<- matrix(0,k,k)
+	MatA[1,] <- Fvec 
+	for(i in 1:(k-1)){
+		MatA[i+1,i] <- Svec[i]
+	}
+	#Individuals can accumulate if Svec[k]>0:
+	MatA[k,k] <- Svec[k] 
+	MatA
+}
+
+# Leslie matrix
+A <- Create.Amat(p$px, p$mx)
+(A)
+```
+
+## Generate reproductive values based on projection matrix
+
+Also based on code provided by: 
+https://shinyibv02.uio.no/content/0b6ba04a-44a1-4a99-baaf-9a1caff48698/s03-MatrixModels.html
+
+```{r}
+# function where the input is the Leslie matrix (projection matrix)
+## three outputs produced:
+### [1] lambda: dominant eigenvalue of A (projection matrix)
+### [2] u: right eigenvector
+### [3] v: left eigenvector
+uvlambda <- function(MatA){
+	ev <- eigen(MatA)
+	tev <- eigen(t(MatA))
+	lmax <- which.max(Re(ev$values))
+	U <- ev$vectors
+	V <- tev$vectors
+	u <- as.matrix(abs(Re(U[, lmax]))/sum(abs(Re(U[, lmax]))))
+	u <- u/(sum(u)) #scale u
+	v <- as.matrix(abs(Re(V[, lmax])))
+	v <- v/sum(u*v ) #scale v
+	v <- t(ifelse(u*v <= 0, 0, v))
+	return(list("lambda"=max(Re(ev$values)),"u"=u,"v"=v))
+}
+
+l <- uvlambda(A)
+(l)
+```
+
+```{r}
+u.rhe <- l$u
+v.rhe <- l$v
+
+# data frame
+asym <- data.frame("AgeClass"=0:30, "u"=u.rhe, "v"=t(v.rhe))
+
+head(asym)
+```
+
+
+```{r}
+#Long format for plotting:
+asym.long <- asym |> 
+  pivot_longer(c(u,v), names_to = "Vector", values_to = "Value")
+
+#Ensure order of factor levels (for plotting)
+asym.long$AgeClass <- factor(asym.long$AgeClass, levels=0:30)
+
+ggplot(asym.long) + 
+  geom_col(aes(x=AgeClass, y=Value, fill=AgeClass ), lwd=1.2)+
+  theme_bw() +
+  facet_wrap(vars(Vector), ncol=2, scales="free")+
+  labs( x="Age class", y="Value")+ #Axis labels
+  theme(legend.position = "None" ) #remove legend
+```
+
+panel 'u' above is the stable age structure, while panel 'v' are the reproductive values
+
+
+## Check values against Hasegawa & Kutsukake (2019) (Figure 1)
+
+```{r}
+# plot
+plot(x=asym$AgeClass, y=asym$v, type="l")
+
+# re-scale values so that value at age 0 is 1
+val <- asym$v[1]  #reproductive value, at age 0
+x <- 1/val
+
+# plot, re-scaled
+plot(x=asym$AgeClass, y=asym$v * x, type="l")
+
+# re-scale in dataframe
+asym$Vx <- asym$v * x
+asym$age <- as.integer(asym$AgeClass)
+```
+
+
+```{r}
+repro_vals <- asym |> select(age, Vx)
+summary(repro_vals)
+
+write.csv(repro_vals, "data_rhe_repro_vals.csv", row.names=F)
+```
+
+
+# weighted, splines for non-linear effects
+
+```{r}
+library(brms)
+
+weights <- p |> select(age, Nχ)
+asym <- asym |> left_join(weights)
+
+mod <- brm(Vx | weights(Nχ) ~ 1 + s(age), 
+						data = asym, cores = 4, chains = 4, seed = 1977)
+
+pp_check(mod)
+```
+
+
+
+```{r}
+ages <- seq(0,32,0.1)
+newdata <- data.frame(age = ages)
+
+t <- predict(mod, newdata=newdata)
+t <- data.frame(t)
+
+t$age <- ages
+t$Estimate[t$Estimate < 0] <- 0
+t$Estimate[t$age > 25] <- 0
+
+t <- t |> dplyr::select(age, Estimate) |> rename(Vx = Estimate)
+
+summary(t)
+```
+
+```{r}
+Vx_max <- max(t$Vx)
+t |> filter(Vx == Vx_max)
+```
+
+```{r}
+t |> filter(Vx == 0) |> head()
+```
+
+
+```{r}
+ggplot(t, aes(x=age, y=Vx)) + 
+	theme_classic(base_size = 24) + 
+	geom_point(alpha = .75) + 
+	geom_line(color = 'red', linewidth = .25) + 
+	geom_point(data=asym, aes(x=age,y=Vx,size=`Nχ`), color='red') + 
+	geom_vline(xintercept = 4.8,  linetype = 3) + #max
+	geom_vline(xintercept = 23.6, linetype = 3) + #min
+	annotate("text", x= 4.8 + 1.5, y=1, label = "4.8") + 
+  annotate("text", x=24.1 + 1.5, y=1, label = "23.6") + 
+	labs(y=expression(paste("reproductive value ( ", italic(V)[X], " )"))) + 
+	theme(legend.position = 'none')
+
+ggsave('subFig_repro_values_rhe.pdf', device = 'pdf', width=20, height=20, 
+			 units='cm', colormodel = 'rgb', dpi = 300)
+```
+
+```{r}
+write.csv(t, "data_repro_values_rhe.csv", row.names=F)
+```
+
+
